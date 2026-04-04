@@ -1,7 +1,0 @@
-[build]
-builder = "nixpacks"
-
-[deploy]
-startCommand = "npx tsx bot/src/engine.ts"
-restartPolicyType = "on_failure"
-restartPolicyMaxRetries = 5
