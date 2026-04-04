@@ -122,7 +122,7 @@ class ScalpBot {
 
     // Check balance
     const balance = await this.connection.getBalance(this.wallet.publicKey);
-    const balanceSOL = balance / 1e9;
+    let balanceSOL = balance / 1e9;
     console.log(`[bot] Wallet balance: ${balanceSOL.toFixed(4)} SOL\n`);
 
     if (balanceSOL < this.config.position.minSolReserve) {
