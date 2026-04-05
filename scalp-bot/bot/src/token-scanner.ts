@@ -401,32 +401,58 @@ export class TokenScanner {
       }
 
       // 2. Simulate a small sell to detect honeypots
-      // If Jupiter can't quote a sell, it's likely a honeypot
+      // Try multiple amounts — micro-cap tokens may not route at tiny sizes
       try {
         const jupUrl = process.env.JUPITER_API_URL ?? "https://api.jup.ag";
         const headers: Record<string, string> = {};
         const apiKey = process.env.JUPITER_API_KEY;
         if (apiKey) headers["x-api-key"] = apiKey;
 
-        const sellRes = await fetch(
-          `${jupUrl}/swap/v1/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=1000000&slippageBps=500`,
-          { headers, signal: AbortSignal.timeout(3000) }
-        );
+        // Try larger amounts first (100M raw units ~= meaningful for 6/9 decimal tokens)
+        const amounts = [100_000_000, 10_000_000, 1_000_000];
+        let sellOk = false;
+        let honeypot = false;
+        let lastStatus = 0;
 
-        if (!sellRes.ok) {
-          reasons.push("⚠ sell_quote_failed");
-          candidate.safetyScore -= 25;
+        for (const amt of amounts) {
+          try {
+            const sellRes = await fetch(
+              `${jupUrl}/swap/v1/quote?inputMint=${mint}&outputMint=${SOL_MINT}&amount=${amt}&slippageBps=1000`,
+              { headers, signal: AbortSignal.timeout(5000) }
+            );
+            lastStatus = sellRes.status;
+
+            if (sellRes.ok) {
+              const sellQuote = await sellRes.json();
+              const outAmount = Number(sellQuote.outAmount ?? 0);
+              if (outAmount === 0) {
+                honeypot = true;
+              } else {
+                sellOk = true;
+              }
+              break; // Got a definitive answer
+            }
+            // 400 = bad route/token not found — try smaller amount
+            // 429 = rate limited — don't keep hammering
+            if (sellRes.status === 429) break;
+          } catch {
+            // timeout — continue to next amount
+          }
+        }
+
+        if (sellOk) {
+          reasons.push("✓ sell_possible");
+        } else if (honeypot) {
+          reasons.push("⚠ HONEYPOT_zero_sell_output");
+          candidate.safetyScore -= 50;
           safe = false;
         } else {
-          const sellQuote = await sellRes.json();
-          const outAmount = Number(sellQuote.outAmount ?? 0);
-          if (outAmount === 0) {
-            reasons.push("⚠ HONEYPOT_zero_sell_output");
-            candidate.safetyScore -= 50;
-            safe = false;
-          } else {
-            reasons.push("✓ sell_possible");
-          }
+          // Could not get a sell quote — likely Jupiter hasn't indexed the pool yet
+          // For fresh Pump.fun tokens this is common and NOT a honeypot signal
+          // Deduct less and warn, but don't block the trade
+          reasons.push(`⚠ sell_quote_unroutable (${lastStatus})`);
+          candidate.safetyScore -= 10;
+          // NOT setting safe = false — fresh pools often can't route via Jupiter yet
         }
       } catch {
         reasons.push("⚠ sell_sim_timeout");
