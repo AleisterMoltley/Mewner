@@ -20,6 +20,8 @@ import { loadConfig, ScalpBotConfig, SOL_MINT, JITO_ENDPOINTS } from "./config";
 import { TokenScanner, TokenCandidate } from "./token-scanner";
 import { PositionManager, SellAction } from "./position-manager";
 import { SwapExecutor } from "./swap-executor";
+import { PumpFunListener, GraduationEvent } from "./pumpfun-listener";
+import { analyzeHolders, analyzeLiquidity, applyHolderScoring } from "./holder-analysis";
 import { DynamicTipEngine } from "./tip-engine";
 import { MultiEndpointSubmitter } from "./multi-endpoint";
 import { CircuitBreaker, DEFAULT_CIRCUIT_BREAKER } from "./safety";
@@ -73,6 +75,8 @@ class ScalpBot {
   private positions: PositionManager;
   private executor: SwapExecutor;
   private circuitBreaker: CircuitBreaker;
+  private pumpListener: PumpFunListener;
+  private graduationQueue: GraduationEvent[] = [];
   private running = false;
   private lastBalanceRefresh = 0;
 
@@ -89,6 +93,12 @@ class ScalpBot {
     this.executor = new SwapExecutor(this.connection, this.wallet, this.config.jupiterUrl, submitter);
 
     this.circuitBreaker = new CircuitBreaker(DEFAULT_CIRCUIT_BREAKER);
+
+    // PumpFun graduation listener — pushes events into queue for main loop
+    this.pumpListener = new PumpFunListener(this.connection, (event) => {
+      this.graduationQueue.push(event);
+      addLog(`🎓 Graduation: ${event.mint.slice(0, 12)}... → ${event.dex}`);
+    });
   }
 
   private loadWallet(): Keypair {
@@ -132,6 +142,12 @@ class ScalpBot {
 
     this.running = true;
     startDashboard();
+
+    // Start PumpFun graduation listener (real-time WebSocket)
+    if (this.config.signal.snipePumpGraduations) {
+      await this.pumpListener.start();
+    }
+
     console.log(`[bot] Entering main loop\n`);
 
     while (this.running) {
@@ -155,12 +171,17 @@ class ScalpBot {
           this.lastBalanceRefresh = Date.now();
         }
 
-        // 3. SCAN for new candidates (only if we have enough SOL and room)
+        // 3. PROCESS graduation events (highest priority — time-sensitive)
+        if (this.positions.canOpenNew() && balanceSOL > this.config.position.minSolReserve + this.config.position.maxPositionSol) {
+          await this.processGraduations();
+        }
+
+        // 4. SCAN for new candidates via DexScreener (lower priority)
         if (this.positions.canOpenNew() && balanceSOL > this.config.position.minSolReserve + this.config.position.maxPositionSol) {
           await this.scanAndBuy();
         }
 
-        // 3. Update dashboard
+        // 5. Update dashboard
         this.updateDashboard(balanceSOL, Date.now() - cycleStart);
 
         await this.sleep(this.config.signal.scanIntervalMs);
@@ -168,6 +189,131 @@ class ScalpBot {
         console.error("[bot] Loop error:", err);
         await this.sleep(5000);
       }
+    }
+  }
+
+  // ─── GRADUATION PROCESSING (real-time PumpFun events) ────────────────────
+
+  private async processGraduations(): Promise<void> {
+    // Drain the queue (process all pending graduations this cycle)
+    while (this.graduationQueue.length > 0) {
+      const event = this.graduationQueue.shift()!;
+
+      // Skip if already tracking or seen
+      if (this.positions.getByMint(event.mint)) continue;
+      if (this.scanner.isSeen(event.mint)) continue;
+      this.scanner.markSeen(event.mint);
+
+      console.log(
+        `[bot] 🎓 GRADUATION SNIPE: ${event.mint.slice(0, 12)}... → ${event.dex} ` +
+        `pool: ${event.poolAddress.slice(0, 12)}...`
+      );
+
+      // Build a candidate from the graduation event
+      // We don't have DexScreener data yet — use minimal info
+      const candidate: TokenCandidate = {
+        mint: event.mint,
+        symbol: event.mint.slice(0, 6),
+        name: "PumpFun Graduate",
+        poolAddress: event.poolAddress,
+        dex: event.dex,
+        pairAddress: event.poolAddress,
+        priceUsd: 0, priceSOL: 0,
+        liquidityUsd: 12_000, // PumpFun graduates with ~$12k liquidity
+        volume24h: 0, volume5m: 0, volume1h: 0,
+        marketCap: 69_000, // Graduation threshold
+        priceChange5m: 0, priceChange1h: 0, priceChange24h: 0,
+        safetyScore: 60, // Start moderate — graduation is a positive signal
+        mintDisabled: true, freezeDisabled: true,
+        topHolderPct: 0, holders: 0,
+        poolAgeSec: 0,
+        entryScore: 80, // High priority — freshest possible entry
+        signalReasons: ["graduation_snipe", event.dex],
+        discoveredAt: Date.now(),
+        source: "pumpfun",
+      };
+
+      // ON-CHAIN VALIDATION (mint/freeze + honeypot check)
+      const validation = await this.scanner.validateOnChain(this.connection, event.mint, candidate);
+      if (!validation.safe) {
+        console.log(`[bot] ⛔ GRAD REJECTED ${candidate.symbol}: ${validation.reasons.join(", ")}`);
+        addLog(`⛔ Grad ${event.mint.slice(0, 8)} rejected: ${validation.reasons.join(", ")}`);
+        continue;
+      }
+
+      // HOLDER + LP ANALYSIS
+      const holderResult = await this.runHolderChecks(event.mint, event.poolAddress, event.dex, candidate);
+      if (!holderResult) continue;
+
+      console.log(`[bot] ✓ Grad validated: ${validation.reasons.join(", ")}`);
+      addLog(`🎓 Snipe ${candidate.symbol} — graduation + validated`);
+
+      // Execute buy — use max position for graduations (highest conviction)
+      const sizeSOL = this.config.position.maxPositionSol;
+      const result = await this.executor.buy(event.mint, sizeSOL, 150, this.config.dryRun, candidate.liquidityUsd);
+
+      if (result.success) {
+        this.positions.open(
+          event.mint, candidate.symbol, event.dex,
+          candidate.priceSOL, candidate.priceUsd,
+          result.amountOut, sizeSOL,
+          candidate.signalReasons
+        );
+        addLog(`✅ GRAD BOUGHT ${candidate.symbol} — ${sizeSOL.toFixed(4)} SOL`);
+      } else {
+        addLog(`❌ GRAD BUY FAILED: ${result.error}`);
+        this.circuitBreaker.recordFailure(`Grad buy failed: ${event.mint.slice(0, 8)}`, 0);
+      }
+
+      // Only one graduation buy per cycle
+      break;
+    }
+  }
+
+  // ─── HOLDER + LP CHECK (shared between graduation and scanner paths) ────
+
+  private async runHolderChecks(
+    mint: string,
+    poolAddress: string,
+    dex: string,
+    candidate: TokenCandidate
+  ): Promise<boolean> {
+    try {
+      const [holders, lp] = await Promise.all([
+        analyzeHolders(this.connection, mint),
+        analyzeLiquidity(this.connection, poolAddress, dex),
+      ]);
+
+      // Apply scoring
+      const { scoreAdj, reasons } = applyHolderScoring(holders, lp);
+      candidate.safetyScore += scoreAdj;
+      candidate.topHolderPct = holders.topHolderPct;
+      candidate.holders = holders.holderCountEstimate;
+
+      console.log(`[bot] 📊 Holders: ${reasons.join(", ")} (adj: ${scoreAdj >= 0 ? "+" : ""}${scoreAdj})`);
+
+      // Hard reject on extreme concentration
+      if (holders.topHolderPct > this.config.tokenSafety.maxTopHolderPct) {
+        console.log(`[bot] ⛔ REJECTED: top holder ${holders.topHolderPct.toFixed(1)}% > ${this.config.tokenSafety.maxTopHolderPct}%`);
+        addLog(`⛔ ${candidate.symbol} whale_${holders.topHolderPct.toFixed(0)}%`);
+        return false;
+      }
+
+      // Hard reject on too few holders (configurable)
+      if (holders.holderCountEstimate < this.config.tokenSafety.minHolders && holders.holderCountEstimate > 0) {
+        // For graduations, be more lenient — fresh tokens have few holders
+        if (candidate.source !== "pumpfun" || holders.holderCountEstimate < 10) {
+          console.log(`[bot] ⛔ REJECTED: only ~${holders.holderCountEstimate} holders`);
+          addLog(`⛔ ${candidate.symbol} too_few_holders_${holders.holderCountEstimate}`);
+          return false;
+        }
+      }
+
+      return true;
+    } catch (err) {
+      console.error(`[bot] Holder check error for ${mint.slice(0, 12)}:`, err);
+      // Don't block on holder check failures — the other safety checks still apply
+      return true;
     }
   }
 
@@ -204,8 +350,12 @@ class ScalpBot {
         addLog(`⛔ ${c.symbol} rejected: ${validation.reasons.join(", ")}`);
         continue;
       }
-      console.log(`[bot] ✓ Validated: ${validation.reasons.join(", ")}`);
 
+      // HOLDER + LP ANALYSIS
+      const holderOk = await this.runHolderChecks(c.mint, c.poolAddress, c.dex, c);
+      if (!holderOk) continue;
+
+      console.log(`[bot] ✓ Validated: ${validation.reasons.join(", ")}`);
       addLog(`🎯 ${c.symbol} score:${c.entryScore} — ${c.signalReasons.join(", ")}`);
 
       // Execute buy
@@ -348,6 +498,7 @@ class ScalpBot {
     const posStats = this.positions.getStats();
     const scanStats = this.scanner.getStats();
     const cbStats = this.circuitBreaker.getStats();
+    const pumpStats = this.pumpListener.getStats();
 
     dashboardData = {
       bot: {
@@ -359,6 +510,7 @@ class ScalpBot {
       positions: posStats,
       scanner: scanStats,
       circuitBreaker: cbStats,
+      pumpfun: pumpStats,
     };
   }
 
@@ -404,6 +556,7 @@ body{background:#0a0e17;color:#c8d6e5;font-family:'Courier New',monospace;paddin
   <div class="card"><div class="label">Balance</div><div class="value" id="balance">—</div><div class="sub">SOL</div></div>
   <div class="card"><div class="label">Scans</div><div class="value" id="scans">—</div></div>
   <div class="card"><div class="label">Candidates</div><div class="value" id="candidates">—</div></div>
+  <div class="card"><div class="label">🎓 Graduations</div><div class="value green" id="grads">—</div></div>
 </div>
 <div id="positionList"></div></div>
 
@@ -434,6 +587,8 @@ async function refresh(){
     $('balance').textContent=b.balanceSOL||'—';
     $('scans').textContent=(s.scans||0).toLocaleString();
     $('candidates').textContent=(s.candidatesFound||0).toLocaleString();
+    const pf=d.pumpfun||{};
+    $('grads').textContent=(pf.graduations||0);
 
     // Positions
     const pl=$('positionList');
